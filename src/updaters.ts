@@ -1,8 +1,7 @@
 import axios from "axios";
-import {chunk, uniq} from "lodash";
+import {chunk} from "lodash";
 import {
     BehaviorSubject,
-    catchError,
     combineLatest,
     debounceTime,
     defer,
@@ -18,15 +17,36 @@ import {
     Subject,
     throttleTime
 } from "rxjs";
-import {map, switchMap, tap} from "rxjs/operators";
-import {createRedisClient, updateCache, updateItems} from "./common";
-import {doUniversalisRequest} from "./universalis";
+import {switchMap, tap} from "rxjs/operators";
+import {
+    buildStaticData,
+    createRedisClient,
+    MbEntry,
+    StaticItemData,
+    updateCache,
+    updateItems,
+    writeMarketEntries
+} from "./common";
+import {universalisGet} from "./universalis";
 import {Item} from "./item";
 import {intervalToDuration} from "date-fns";
 import {exec} from "child_process";
 import {GAME_SERVERS} from "./servers";
+import {RedisClientType} from "redis";
 
-const items$ = new ReplaySubject<Record<number, Item>>();
+interface ItemsBundle {
+    items: Record<number, Item>;
+    staticData: Record<number, StaticItemData>;
+}
+
+interface ServerRunResult {
+    server: string;
+    success: boolean;
+    failedChunks: number;
+    time: number;
+}
+
+const items$ = new ReplaySubject<ItemsBundle>(1);
 const delayBetweenRuns = 3600000;
 const updated$ = new Subject<void>();
 
@@ -73,7 +93,9 @@ function properConcat<T>(sources: Observable<T>[]): Observable<T[]> {
                 requirements
             };
         });
-    items$.next(items);
+    // complexity / levelReqs ne dependent pas du serveur : une seule passe pour les 118 mondes
+    console.log('Precomputing server-independent item data');
+    items$.next({items, staticData: buildStaticData(items)});
 })();
 
 const errors$ = new Subject<{ source: string, message: string }>();
@@ -94,13 +116,65 @@ errors$.pipe(
     });
 })
 
+/**
+ * La liste des items marchands conditionne tout le cycle : on insiste jusqu'a l'obtenir
+ * plutot que de demarrer sur une liste vide.
+ */
+async function fetchMarketableIds(): Promise<number[]> {
+    for (; ;) {
+        const res = await universalisGet<number[]>('https://universalis.app/api/marketable', errors$);
+        if (res.ok) {
+            return res.data;
+        }
+        console.error(`Liste des items marchands indisponible (${res.reason}), nouvelle tentative dans 30s`);
+        await new Promise(resolve => setTimeout(resolve, 30000));
+    }
+}
+
+/**
+ * Un serveur complet. Les requetes sont toutes lancees d'un coup : c'est le token bucket
+ * de universalis.ts qui regule le debit, plus la structure du pipeline.
+ *
+ * Un chunk en echec ne fait plus tomber (ni bloquer) le serveur entier : on ecrit ce
+ * qu'on a, et on remonte le nombre de chunks manquants dans le rapport.
+ */
+async function updateServer(server: string, bundle: ItemsBundle, itemIds: number[],
+                            redis: RedisClientType): Promise<ServerRunResult> {
+    const start = Date.now();
+    console.log(`Starting MB data aggregation for ${server}`);
+    try {
+        const chunks = chunk(itemIds, 100);
+        const results = await Promise.all(chunks.map(ids => updateItems(server, ids, errors$)));
+        const failedChunks = results.filter(res => !res.ok).length;
+
+        const data: Record<number, MbEntry> = {};
+        for (const res of results) {
+            Object.assign(data, res.data);
+        }
+
+        if (Object.keys(data).length > 0) {
+            await writeMarketEntries(redis, server, data);
+            await updateCache(server, bundle.items, bundle.staticData, redis);
+            await redis.set(`profit:${server}:updated`, Date.now());
+        }
+
+        const time = Date.now() - start;
+        console.log(`${server} ${failedChunks === 0 ? 'ok' : `partiel (${failedChunks}/${chunks.length} chunks KO)`}, ${Math.floor(time / 1000)}s`);
+        return {server, success: failedChunks === 0, failedChunks, time};
+    } catch (err) {
+        errors$.next({source: `[Updater] Server ${server}`, message: err.message});
+        console.log(err.message);
+        return {server, success: false, failedChunks: -1, time: Date.now() - start};
+    }
+}
+
 console.log('Creating core data Observable');
 
 const coreData$ = combineLatest([
     of(GAME_SERVERS),
     from(createRedisClient()),
     items$,
-    doUniversalisRequest<number[]>('https://universalis.app/api/marketable', errors$)
+    from(fetchMarketableIds())
 ]).pipe(
     shareReplay(1)
 );
@@ -118,7 +192,7 @@ axios.post(process.env.WEBHOOK, {
 
 
 coreData$.pipe(
-    switchMap(([servers, redis, items, itemIds]) => {
+    switchMap(([servers, redis, bundle, itemIds]) => {
         return defer(() => {
             const expectedDuration = intervalToDuration({start: 0, end: servers.length * 180000});
             axios.post(process.env.WEBHOOK, {
@@ -130,59 +204,8 @@ coreData$.pipe(
                 username: 'Profits Helper Updater'
             }).catch(err => console.log(err.message));
             return properConcat(servers.map(server => {
-                    const chunks = chunk(itemIds, 100);
-                    return of(chunks).pipe(
-                        switchMap(() => {
-                            const start = Date.now();
-                            console.log(`Starting MB data aggregation for ${server}`);
-                            return combineLatest(
-                                chunks.map((ids) => {
-                                    return updateItems(server, ids, errors$);
-                                })
-                            ).pipe(
-                                switchMap(res => {
-                                    if (res.length === 0) {
-                                        return of([]);
-                                    }
-                                    return combineLatest(res.map(row => {
-                                        const itemIds = Object.keys(row.data);
-                                        if (itemIds.length === 0) {
-                                            return of([]);
-                                        }
-                                        return combineLatest(itemIds.map(id => {
-                                            return from(redis.set(`mb:${row.server}:${id}`, JSON.stringify(row.data[+id])));
-                                        }));
-                                    })).pipe(
-                                        switchMap(() => {
-                                            return from(updateCache(uniq(res.map(row => row.server)), items, redis));
-                                        })
-                                    );
-                                }),
-                                switchMap(() => {
-                                    return from(redis.set(`profit:${server}:updated`, Date.now()))
-                                }),
-                                map(() => {
-                                    console.log(`${server} ok, ${Math.floor((Date.now() - start) / 1000)}s`);
-                                    return {
-                                        server,
-                                        success: true,
-                                        time: Date.now() - start
-                                    }
-                                }),
-                                catchError((err) => {
-                                    errors$.next({source: `[Updater] Server ${server}`, message: err.message});
-                                    console.log(err.message)
-                                    return of({
-                                        server,
-                                        success: false,
-                                        time: Date.now() - start
-                                    })
-                                }),
-                            )
-                        })
-                    );
-                })
-            )
+                return defer(() => from(updateServer(server, bundle, itemIds, redis)));
+            }));
         }).pipe(
             repeat({
                 delay: delayBetweenRuns
@@ -193,6 +216,7 @@ coreData$.pipe(
     const success = result.every(row => row.success);
     const failedServers = result.filter(row => !row.success).map(row => row.server);
     const totalTime = result.reduce((acc, r) => acc + r.time, 0);
+    const missingChunks = result.reduce((acc, r) => acc + Math.max(0, r.failedChunks), 0);
     const duration = intervalToDuration({start: 0, end: totalTime});
     const fields = [
         {
@@ -207,8 +231,12 @@ coreData$.pipe(
     if (!success) {
         fields.push({
             name: 'Failed servers',
-            value: failedServers.reduce((acc, server) => `${acc}\n - ${server}`)
-        })
+            value: failedServers.map(server => ` - ${server}`).join('\n').slice(0, 1024)
+        });
+        fields.push({
+            name: 'Missing chunks',
+            value: `${missingChunks}`
+        });
     }
     const report = {
         content: null,

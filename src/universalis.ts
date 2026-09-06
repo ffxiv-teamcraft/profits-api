@@ -83,6 +83,14 @@ class Semaphore {
     constructor(private readonly limit: number) {
     }
 
+    get inFlight(): number {
+        return this.active;
+    }
+
+    get queued(): number {
+        return this.waiting.length;
+    }
+
     async acquire(): Promise<void> {
         if (this.active < this.limit) {
             this.active++;
@@ -103,6 +111,72 @@ class Semaphore {
 
 const limiter = new RateLimiter(RATE_PER_SEC);
 const gate = new Semaphore(CONCURRENCY);
+
+/**
+ * Compteurs du cycle courant. Ils alimentent le rapport Discord : c'est ce qui evite
+ * d'avoir a ouvrir les logs pour savoir si un cycle se passe bien.
+ *
+ * On distingue les tentatives ratees (bruit : une 503 retentee avec succes n'appelle
+ * aucune action) des abandons definitifs (actionnable : de la donnee manque).
+ */
+export interface UniversalisSnapshot {
+    requests: number;
+    succeeded: number;
+    abandoned: number;
+    attemptFailures: number;
+    attemptsByStatus: Record<string, number>;
+    abandonsByStatus: Record<string, number>;
+    sampleFailures: string[];
+    currentRate: number;
+    configuredRate: number;
+    inFlight: number;
+    queued: number;
+}
+
+const stats = {
+    requests: 0,
+    succeeded: 0,
+    abandoned: 0,
+    attemptFailures: 0,
+    attemptsByStatus: {} as Record<string, number>,
+    abandonsByStatus: {} as Record<string, number>,
+    sampleFailures: [] as string[]
+};
+
+function bump(bucket: Record<string, number>, key: string): void {
+    bucket[key] = (bucket[key] || 0) + 1;
+}
+
+export function snapshotStats(): UniversalisSnapshot {
+    return {
+        requests: stats.requests,
+        succeeded: stats.succeeded,
+        abandoned: stats.abandoned,
+        attemptFailures: stats.attemptFailures,
+        attemptsByStatus: {...stats.attemptsByStatus},
+        abandonsByStatus: {...stats.abandonsByStatus},
+        sampleFailures: stats.sampleFailures.slice(),
+        currentRate: limiter.currentRate,
+        configuredRate: RATE_PER_SEC,
+        inFlight: gate.inFlight,
+        queued: gate.queued
+    };
+}
+
+export function resetStats(): void {
+    stats.requests = 0;
+    stats.succeeded = 0;
+    stats.abandoned = 0;
+    stats.attemptFailures = 0;
+    stats.attemptsByStatus = {};
+    stats.abandonsByStatus = {};
+    stats.sampleFailures = [];
+}
+
+/** Debit cible, utilise pour estimer la duree d'un cycle avant toute mesure. */
+export function getConfiguredRate(): number {
+    return RATE_PER_SEC;
+}
 
 /**
  * Coupe-circuit progressif : si Universalis souffre, on ralentit tout seul,
@@ -152,6 +226,8 @@ export async function universalisGet<T = any>(url: string, errors$?: ErrorSink):
     const deadline = Date.now() + TOTAL_BUDGET_MS;
     let lastStatus: number | null = null;
     let lastReason = 'unknown error';
+    let lastLabel = 'unknown';
+    stats.requests++;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         await limiter.take();
@@ -159,13 +235,17 @@ export async function universalisGet<T = any>(url: string, errors$?: ErrorSink):
         try {
             const res = await http.get<T>(url);
             onSuccess();
+            stats.succeeded++;
             return {ok: true, data: res.data};
         } catch (e) {
             const err = e as AxiosError;
             const {retryable, status, waitMs} = classify(err);
             lastStatus = status;
-            lastReason = `[${status !== null ? status : err.code}] ${err.message}`;
+            lastLabel = String(status !== null ? status : err.code || 'network');
+            lastReason = `[${lastLabel}] ${err.message}`;
             onFailure();
+            stats.attemptFailures++;
+            bump(stats.attemptsByStatus, lastLabel);
             if (!retryable || attempt === MAX_ATTEMPTS || Date.now() > deadline) {
                 break;
             }
@@ -175,6 +255,12 @@ export async function universalisGet<T = any>(url: string, errors$?: ErrorSink):
         } finally {
             gate.release();
         }
+    }
+
+    stats.abandoned++;
+    bump(stats.abandonsByStatus, lastLabel);
+    if (stats.sampleFailures.length < 5) {
+        stats.sampleFailures.push(`[${lastLabel}] ${url.slice(0, 110)}`);
     }
 
     console.error(`${lastReason}\n${url}`);

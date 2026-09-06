@@ -28,8 +28,9 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Discord tolere ~5 requetes / 2s par webhook. Tout passe par une chaine serialisee :
- * deux editions concurrentes ne peuvent pas se doubler ni declencher un 429.
+ * Discord allows roughly 5 requests / 2s per webhook. Everything goes through a
+ * serialised chain, so two concurrent edits can never overtake each other or
+ * trigger a 429.
  */
 let chain: Promise<any> = Promise.resolve();
 
@@ -38,7 +39,7 @@ function enqueue<T>(task: () => Promise<T>, fallback: T): Promise<T> {
         console.log(`[DISCORD] ${err.message}`);
         return fallback;
     }));
-    // On espace les appels, et la chaine ne doit jamais rester cassee.
+    // Space the calls out, and never leave the chain in a rejected state.
     chain = run.then(() => sleep(350), () => sleep(350));
     return run;
 }
@@ -62,7 +63,7 @@ async function send(method: 'post' | 'patch', url: string, body: any): Promise<a
 }
 
 /**
- * Poste un message. Avec `track`, renvoie son id pour pouvoir l'editer ensuite.
+ * Posts a message. With `track`, returns its id so it can be edited later.
  */
 export function postMessage(payload: DiscordPayload, track = false): Promise<string | null> {
     return enqueue(async () => {
@@ -76,10 +77,10 @@ export function postMessage(payload: DiscordPayload, track = false): Promise<str
 }
 
 /**
- * Edite un message deja poste. C'est ce qui permet de suivre un cycle en direct
- * sans ajouter une ligne dans le salon a chaque rafraichissement.
+ * Edits an already posted message. This is what lets a cycle be followed live
+ * without adding a line to the channel on every refresh.
  *
- * L'endpoint d'edition n'accepte pas `username` : on ne renvoie que le contenu.
+ * The edit endpoint rejects `username`, so only the content is sent back.
  */
 export function editMessage(messageId: string, payload: DiscordPayload): Promise<boolean> {
     return enqueue(async () => {
@@ -94,7 +95,7 @@ export function editMessage(messageId: string, payload: DiscordPayload): Promise
     }, false);
 }
 
-/** Barre de progression textuelle, lisible dans une description d'embed. */
+/** Text progress bar, readable inside an embed description. */
 export function progressBar(ratio: number, width = 22): string {
     const clamped = Math.min(1, Math.max(0, ratio || 0));
     const filled = Math.round(clamped * width);
@@ -102,8 +103,8 @@ export function progressBar(ratio: number, width = 22): string {
 }
 
 /**
- * Horodatage relatif Discord : le client reaffiche "dans 12 minutes" tout seul,
- * ce qui garde l'estimation vivante entre deux editions.
+ * Discord relative timestamp: the client keeps re-rendering "in 12 minutes" on its
+ * own, which keeps the estimate alive between two edits.
  */
 export function relativeTime(timestampMs: number): string {
     return `<t:${Math.floor(timestampMs / 1000)}:R>`;

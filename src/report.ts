@@ -24,25 +24,26 @@ export interface CycleState {
     editFailures: number;
 }
 
-/** Limites Discord : 1024 caracteres par champ, 6000 pour l'embed entier. */
+/** Discord limits: 1024 characters per field, 6000 for the whole embed. */
 const FIELD_LIMIT = 1024;
 
 /**
- * Estimation a priori, utilisee tant qu'aucun cycle n'a ete mesure. Le facteur
- * limitant est le token bucket : deux requetes par chunk, plafonnees au debit cible.
- * L'ancienne formule (180 s par serveur, en dur) datait d'avant l'optimisation et
- * annoncait ~6 h pour un cycle qui en prend une fraction.
+ * A priori estimate, used until a cycle has actually been measured. The limiting
+ * factor is the token bucket: two requests per chunk, capped at the target rate.
+ * The previous formula (a hardcoded 180s per server) predated the API work and
+ * announced ~6 hours for a cycle that now takes a fraction of that.
  */
 export function aprioriCycleMs(chunksTotal: number, serversTotal: number, ratePerSec: number): number {
     const httpMs = (chunksTotal * 2 / Math.max(1, ratePerSec)) * 1000;
-    // recalcul du cache + ecritures groupees, de l'ordre de la seconde par serveur
+    // cache recomputation plus batched writes, roughly a second per server
     const redisMs = serversTotal * 1500;
     return Math.round(httpMs + redisMs);
 }
 
 /**
- * Temps restant. Des qu'un chunk est passe on extrapole sur le rythme reel du cycle
- * en cours, ce qui absorbe un Universalis lent sans attendre le cycle suivant.
+ * Remaining time. As soon as one chunk is done we extrapolate from the rate the
+ * cycle is actually running at, which absorbs a slow Universalis within seconds
+ * instead of waiting for the next cycle.
  */
 export function remainingMs(state: CycleState, now: number = Date.now()): number {
     const elapsed = now - state.startedAt;
@@ -62,20 +63,20 @@ function breakdown(bucket: Record<string, number>): string {
 export function incidentSummary(snap: UniversalisSnapshot, failed: ServerRunResult[]): string {
     const lines: string[] = [];
     if (snap.abandoned > 0) {
-        lines.push(`**${snap.abandoned}** requête(s) abandonnée(s) — ${breakdown(snap.abandonsByStatus)}`);
+        lines.push(`**${snap.abandoned}** request(s) abandoned — ${breakdown(snap.abandonsByStatus)}`);
     }
     if (snap.attemptFailures > snap.abandoned) {
-        lines.push(`${snap.attemptFailures} tentative(s) en échec puis reprises — ${breakdown(snap.attemptsByStatus)}`);
+        lines.push(`${snap.attemptFailures} failed attempt(s), recovered on retry — ${breakdown(snap.attemptsByStatus)}`);
     }
     if (snap.currentRate < snap.configuredRate) {
-        lines.push(`Débit réduit automatiquement : ${snap.currentRate.toFixed(1)} / ${snap.configuredRate} req/s`);
+        lines.push(`Throughput automatically reduced: ${snap.currentRate.toFixed(1)} / ${snap.configuredRate} req/s`);
     }
     if (failed.length > 0) {
         const names = failed.slice(0, 12).map(r => r.server).join(', ');
-        const extra = failed.length > 12 ? ` (+${failed.length - 12} autres)` : '';
-        lines.push(`Serveurs incomplets : ${names}${extra}`);
+        const extra = failed.length > 12 ? ` (+${failed.length - 12} more)` : '';
+        lines.push(`Incomplete servers: ${names}${extra}`);
     }
-    return lines.join('\n').slice(0, FIELD_LIMIT) || 'Aucun';
+    return lines.join('\n').slice(0, FIELD_LIMIT) || 'None';
 }
 
 export function runningEmbed(state: CycleState, snap: UniversalisSnapshot, now: number = Date.now()): DiscordEmbed {
@@ -85,27 +86,27 @@ export function runningEmbed(state: CycleState, snap: UniversalisSnapshot, now: 
     const degraded = snap.abandoned > 0 || failed.length > 0;
 
     const fields = [
-        {name: 'Serveurs', value: `${state.serversDone} / ${state.serversTotal}`, inline: true},
+        {name: 'Servers', value: `${state.serversDone} / ${state.serversTotal}`, inline: true},
         {name: 'Chunks', value: `${state.chunksDone} / ${state.chunksTotal}`, inline: true},
-        {name: 'Débit', value: `${snap.currentRate.toFixed(1)} req/s`, inline: true},
-        {name: 'Écoulé', value: formatDuration(elapsed), inline: true},
-        {name: 'Restant', value: formatDuration(remaining), inline: true},
-        {name: 'Requêtes OK', value: `${snap.succeeded} / ${snap.requests}`, inline: true}
+        {name: 'Throughput', value: `${snap.currentRate.toFixed(1)} req/s`, inline: true},
+        {name: 'Elapsed', value: formatDuration(elapsed), inline: true},
+        {name: 'Remaining', value: formatDuration(remaining), inline: true},
+        {name: 'Requests OK', value: `${snap.succeeded} / ${snap.requests}`, inline: true}
     ];
     if (degraded) {
         fields.push({name: 'Incidents', value: incidentSummary(snap, failed), inline: false});
     }
 
     return {
-        title: 'Mise à jour en cours',
+        title: 'Full update in progress',
         color: degraded ? COLOR_WARN : COLOR_RUNNING,
         description: `${progressBar(state.chunksDone / Math.max(1, state.chunksTotal))}\n`
-            + `Fin estimée ${relativeTime(now + remaining)}`,
+            + `Expected to finish ${relativeTime(now + remaining)}`,
         fields,
         footer: {
             text: state.serversDone === 0
-                ? `Estimation ${state.estimateFromHistory ? 'basée sur les cycles précédents' : 'théorique (premier cycle)'}`
-                : `Serveur courant : ${state.currentServer}`
+                ? `Estimate ${state.estimateFromHistory ? 'based on previous cycles' : 'theoretical (first cycle)'}`
+                : `Current server: ${state.currentServer}`
         }
     };
 }
@@ -119,29 +120,29 @@ export function finalEmbed(state: CycleState, snap: UniversalisSnapshot, nextRun
     const itemsWritten = state.results.reduce((acc, r) => acc + r.items, 0);
 
     const fields = [
-        {name: 'Durée', value: formatDuration(duration), inline: true},
-        {name: 'Moy. / serveur', value: formatDuration(duration / Math.max(1, state.results.length)), inline: true},
-        {name: 'Plus lent', value: slowest ? `${slowest.server} · ${formatDuration(slowest.time)}` : '—', inline: true},
-        {name: 'Requêtes OK', value: `${snap.succeeded} / ${snap.requests}`, inline: true},
-        {name: 'Entrées écrites', value: `${itemsWritten}`, inline: true},
-        {name: 'Prochain cycle', value: relativeTime(nextRunAt), inline: true}
+        {name: 'Duration', value: formatDuration(duration), inline: true},
+        {name: 'Avg per server', value: formatDuration(duration / Math.max(1, state.results.length)), inline: true},
+        {name: 'Slowest', value: slowest ? `${slowest.server} · ${formatDuration(slowest.time)}` : '—', inline: true},
+        {name: 'Requests OK', value: `${snap.succeeded} / ${snap.requests}`, inline: true},
+        {name: 'Entries written', value: `${itemsWritten}`, inline: true},
+        {name: 'Next cycle', value: relativeTime(nextRunAt), inline: true}
     ];
     if (!success || snap.abandoned > 0) {
         fields.push({name: 'Incidents', value: incidentSummary(snap, failed), inline: false});
     }
 
     return {
-        title: success ? 'Mise à jour terminée' : 'Mise à jour terminée avec des manques',
+        title: success ? 'Full update complete' : 'Full update complete, with gaps',
         color: success ? COLOR_OK : COLOR_ERROR,
         description: progressBar(1),
         fields,
-        footer: {text: `${state.serversTotal} serveurs · ${state.chunksTotal} chunks`}
+        footer: {text: `${state.serversTotal} servers · ${state.chunksTotal} chunks`}
     };
 }
 
 /**
- * Un cycle merite un ping separe seulement s'il est actionnable : editer un embed
- * ne declenche aucune notification Discord, donc on poste un message dedie.
+ * A cycle only deserves its own ping when it is actionable: editing an embed fires
+ * no Discord notification, so a dedicated message is posted instead.
  */
 export function isDegraded(state: CycleState, snap: UniversalisSnapshot): boolean {
     const failed = state.results.filter(r => !r.success).length;

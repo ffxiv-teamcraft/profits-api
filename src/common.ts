@@ -4,7 +4,7 @@ import {subHours} from 'date-fns';
 import {ErrorSink, universalisGet, UniversalisResult} from './universalis';
 import {chunk, uniqBy} from 'lodash';
 
-/** Entree marche stockee sous mb:{server}:{itemId}. */
+/** Market entry stored under mb:{server}:{itemId}. */
 export interface MbEntry {
     v24: number;
     v48: number;
@@ -16,7 +16,7 @@ export interface MbEntry {
     tr24: number;
 }
 
-/** Donnees independantes du serveur : calculees une seule fois, pas 118 fois. */
+/** Server-independent data: computed once, not 118 times. */
 export interface StaticItemData {
     crafting: boolean;
     gathering: boolean;
@@ -37,11 +37,11 @@ export async function createRedisClient(): Promise<RedisClientType> {
     const client = createClient({
         url: `redis://${REDISHOST}:${REDISPORT}`,
         socket: {
-            // On ne tue plus le process au premier hoquet reseau : on retente,
-            // et on n'abandonne qu'apres 10 tentatives infructueuses.
+            // No longer kill the process on the first network hiccup: retry, and
+            // only give up after 10 unsuccessful attempts.
             reconnectStrategy: retries => {
                 if (retries > 10) {
-                    console.error('REDIS: 10 tentatives de reconnexion echouees, arret.');
+                    console.error('REDIS: 10 reconnection attempts failed, giving up.');
                     return new Error('redis unreachable');
                 }
                 return Math.min(1000 * retries, 10000);
@@ -109,8 +109,8 @@ export function getLevelRequirements(item: Item, items: Record<number, Item>): n
 }
 
 /**
- * complexity et levelReqs ne dependent que de la recette, jamais du serveur.
- * On les calcule une fois au demarrage au lieu de les recalculer pour chaque monde.
+ * complexity and levelReqs depend only on the recipe, never on the server. They are
+ * computed once at startup instead of being recomputed for every world.
  */
 export function buildStaticData(items: Record<number, Item>): Record<number, StaticItemData> {
     const staticData: Record<number, StaticItemData> = {};
@@ -126,8 +126,8 @@ export function buildStaticData(items: Record<number, Item>): Record<number, Sta
 }
 
 /**
- * Resout le cout de craft entierement en memoire, avec memoisation : un item partage
- * par des dizaines de recettes n'est evalue qu'une seule fois par serveur.
+ * Resolves craft cost entirely in memory, with memoisation: an item shared by dozens
+ * of recipes is evaluated only once per server.
  */
 function createCostResolver(items: Record<number, Item>, prices: Map<number, MbEntry>): (id: number) => number {
     const memo = new Map<number, number>();
@@ -141,7 +141,7 @@ function createCostResolver(items: Record<number, Item>, prices: Map<number, MbE
             return -1;
         }
         if (visiting.has(id)) {
-            // garde-fou : une recette cyclique ne doit pas faire exploser la pile
+            // guard: a cyclic recipe must not blow the stack
             return -1;
         }
         visiting.add(id);
@@ -165,14 +165,13 @@ function createCostResolver(items: Record<number, Item>, prices: Map<number, MbE
     return resolve;
 }
 
-/** Seuls ces deux champs sont consommes en aval. */
+/** Only these two fields are consumed downstream. */
 const LISTING_FIELDS = 'items.listings.pricePerUnit,items.listings.quantity';
 
 /**
- * Listings seuls. `entries=0` est le point cle : par defaut cet endpoint renvoie aussi
- * recentHistory, que l'ancien code allait ensuite rechercher via /api/history. On payait
- * donc l'historique deux fois. Mesure sur un chunk de 100 items (Odin) : 5115 ms -> 82 ms,
- * et 427 Ko -> 35 Ko.
+ * Listings only. `entries=0` is the key part: by default this endpoint also returns
+ * recentHistory, which the old code then fetched again through /api/history -- history
+ * was paid for twice. Measured on a 100-item chunk (Odin): 5115ms -> 82ms, 427KB -> 35KB.
  */
 export function buildListingsUrl(server: string, itemIds: number[]): string {
     return `https://universalis.app/api/v2/${encodeURIComponent(server)}/${itemIds.join(',')}`
@@ -180,13 +179,12 @@ export function buildListingsUrl(server: string, itemIds: number[]): string {
 }
 
 /**
- * Historique 48h. Deux particularites de cet endpoint : il ignore `fields`, et ses
- * entrees n'exposent pas `total` (contrairement au recentHistory de l'endpoint
- * principal) — on le reconstruit cote client.
+ * 48h history. Two quirks of this endpoint: it ignores `fields`, and its entries do
+ * not expose `total` (unlike recentHistory on the main endpoint), so it is rebuilt
+ * client-side.
  *
- * A ne pas fusionner avec l'appel listings : demander listings + historique en une
- * requete est 10 a 50x plus lent (mesure : 8,5 a 23,5 s contre 0,45 s pour les deux
- * appels en parallele).
+ * Do not merge this with the listings call: asking for listings + history in a single
+ * request is 10 to 50x slower (measured: 8.5-23.5s against 0.45s for the parallel pair).
  */
 export function buildHistoryUrl(server: string, itemIds: number[]): string {
     return `https://universalis.app/api/v2/history/${encodeURIComponent(server)}/${itemIds.join(',')}`
@@ -197,21 +195,21 @@ export async function updateItems(server: string, itemIds: number[], errors$?: E
     const yesterday = Math.floor(subHours(new Date(), 24).getTime() / 1000);
     const oneDaybeforeYesterday = Math.floor(subHours(new Date(), 48).getTime() / 1000);
 
-    // Les deux appels partent ensemble : l'attente est celle du plus lent, pas la somme.
+    // Both calls go out together: the wait is the slower of the two, not their sum.
     const [listingsRes, historyRes]: UniversalisResult<any>[] = await Promise.all([
         universalisGet<any>(buildListingsUrl(server, itemIds), errors$),
         universalisGet<any>(buildHistoryUrl(server, itemIds), errors$)
     ]);
     if (!listingsRes.ok || !historyRes.ok) {
-        // On exige les deux : mieux vaut conserver les valeurs precedentes en Redis
-        // qu'ecrire un jeu incomplet. Un v24 perime est moins faux qu'un v24 a zero.
+        // Both are required: keeping the previous Redis values beats writing an
+        // incomplete set. A stale v24 is less wrong than a v24 of zero.
         return {server, ok: false, data: {}, reason: listingsRes.reason || historyRes.reason};
     }
 
     const historyItems = historyRes.data.items || {};
     const data: Record<number, MbEntry> = {};
-    // En v2 `items` est un objet indexe par id (et non un tableau), et les items
-    // non marchands sont simplement absents de la reponse.
+    // In v2 `items` is an object keyed by id (not an array), and non-marketable
+    // items are simply absent from the response.
     for (const [rawId, item] of Object.entries<any>(listingsRes.data.items || {})) {
         const listings = item.listings || [];
         const entries = historyItems[rawId]?.entries || [];
@@ -221,9 +219,9 @@ export async function updateItems(server: string, itemIds: number[], errors$?: E
         const v24 = last24hSales.reduce((total: number, e: { quantity: number }) => total + e.quantity, 0);
         const v48 = entries.filter((h: { timestamp: number }) => h.timestamp > oneDaybeforeYesterday)
             .reduce((total: number, e: { quantity: number }) => total + e.quantity, 0);
-        // L'ancien code lisait e.total, absent de /api/history : la somme valait NaN et
-        // avg24 retombait sur 0 via `|| 0`. Identite verifiee sur 419 ventes reelles
-        // (dont 325 avec quantity > 1) : total === pricePerUnit * quantity.
+        // The old code read e.total, absent from /api/history: the sum was NaN and
+        // avg24 fell back to 0 through `|| 0`. Identity verified on 419 real sales
+        // (325 of them with quantity > 1): total === pricePerUnit * quantity.
         const revenue24 = last24hSales.reduce((total: number, e: any) => total + e.pricePerUnit * e.quantity, 0);
         const avg24 = Math.floor(revenue24 / v24) || 0;
         const t = listings.reduce((accp: number, a: any) => accp + a.quantity, 0);
@@ -236,7 +234,7 @@ export async function updateItems(server: string, itemIds: number[], errors$?: E
     return {server, ok: true, data};
 }
 
-/** Ecriture groupee : ~17 000 SET unitaires deviennent ~17 pipelines. */
+/** Batched writes: ~17,000 individual SETs become ~17 pipelines. */
 export async function writeMarketEntries(redis: RedisClientType, server: string,
                                          data: Record<number, MbEntry>): Promise<void> {
     for (const batch of chunk(Object.entries(data), 1000)) {
@@ -249,9 +247,9 @@ export async function writeMarketEntries(redis: RedisClientType, server: string,
 }
 
 /**
- * Anciennement ~240 000 allers-retours Redis sequentiels par serveur (un get par item,
- * plus un get par ingredient a chaque niveau de recette, plus un get redondant pour le
- * profit). Desormais : quelques MGET, puis tout le calcul en memoire.
+ * Previously ~240,000 sequential Redis round trips per server (one get per item, one
+ * more per ingredient at every recipe depth, plus a redundant get for profit). Now: a
+ * handful of MGETs, then everything computed in memory.
  */
 export async function updateCache(server: string, items: Record<number, Item>,
                                   staticData: Record<number, StaticItemData>,
@@ -265,7 +263,7 @@ export async function updateCache(server: string, items: Record<number, Item>,
                 try {
                     prices.set(+batch[i], JSON.parse(raw[i]));
                 } catch {
-                    // entree corrompue : on l'ignore plutot que de faire tomber le cycle
+                    // corrupt entry: skip it rather than bringing the cycle down
                 }
             }
         }

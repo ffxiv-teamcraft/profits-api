@@ -36,7 +36,7 @@ const items$ = new ReplaySubject<ItemsBundle>(1);
 const delayBetweenRuns = 3600000;
 const updated$ = new Subject<void>();
 
-/** Rafraichissement du message de progression. Une edition ne cree pas de ligne. */
+/** Progress message refresh rate. An edit does not add a line to the channel. */
 const PROGRESS_INTERVAL_MS = 45000;
 const MENTION = '<@194378871317987328>';
 const CYCLE_AVG_KEY = 'updater:avg-cycle-ms';
@@ -68,14 +68,14 @@ const PROGRESS_MSG_KEY = 'updater:progress-message';
                 requirements
             };
         });
-    // complexity / levelReqs ne dependent pas du serveur : une seule passe pour les 118 mondes
+    // complexity / levelReqs do not depend on the server: one pass for all 118 worlds
     console.log('Precomputing server-independent item data');
     items$.next({items, staticData: buildStaticData(items)});
 })();
 
 /**
- * La liste des items marchands conditionne tout le cycle : on insiste jusqu'a l'obtenir
- * plutot que de demarrer sur une liste vide.
+ * The marketable item list gates the whole cycle, so keep asking for it rather than
+ * starting on an empty list.
  */
 async function fetchMarketableIds(): Promise<number[]> {
     for (; ;) {
@@ -83,7 +83,7 @@ async function fetchMarketableIds(): Promise<number[]> {
         if (res.ok) {
             return res.data;
         }
-        console.error(`Liste des items marchands indisponible (${res.reason}), nouvelle tentative dans 30s`);
+        console.error(`Marketable item list unavailable (${res.reason}), retrying in 30s`);
         await new Promise(resolve => setTimeout(resolve, 30000));
     }
 }
@@ -94,7 +94,7 @@ async function loadAvgCycleMs(redis: RedisClientType): Promise<number> {
     return isFinite(value) && value > 0 ? value : 0;
 }
 
-/** Moyenne glissante : un cycle atypique ne fausse pas durablement l'estimation. */
+/** Rolling average, so one atypical cycle does not skew the estimate for long. */
 async function recordCycleMs(redis: RedisClientType, ms: number): Promise<void> {
     const previous = await loadAvgCycleMs(redis);
     const next = previous ? Math.round(previous * 0.7 + ms * 0.3) : Math.round(ms);
@@ -102,8 +102,8 @@ async function recordCycleMs(redis: RedisClientType, ms: number): Promise<void> 
 }
 
 /**
- * Rafraichit le message du cycle. On edite le message existant : le salon garde une
- * seule ligne par cycle, quelle que soit la frequence de rafraichissement.
+ * Refreshes the cycle message. The existing message is edited, so the channel keeps
+ * a single line per cycle no matter how often we refresh.
  */
 async function refresh(state: CycleState, embed?: DiscordEmbed): Promise<void> {
     const payload = {embeds: [embed || runningEmbed(state, snapshotStats())]};
@@ -113,7 +113,7 @@ async function refresh(state: CycleState, embed?: DiscordEmbed): Promise<void> {
             return;
         }
         state.editFailures++;
-        // Message supprime ou webhook recree : on en repost un, mais pas a chaque essai.
+        // Message deleted or webhook recreated: post a new one, but not on every try.
         if (state.editFailures < 3) {
             return;
         }
@@ -124,11 +124,11 @@ async function refresh(state: CycleState, embed?: DiscordEmbed): Promise<void> {
 }
 
 /**
- * Un serveur complet. Les requetes partent toutes d'un coup : c'est le token bucket
- * de universalis.ts qui regule le debit.
+ * One full server. Every request is fired at once: the token bucket in universalis.ts
+ * is what regulates the throughput.
  *
- * Un chunk en echec ne fait plus tomber (ni bloquer) le serveur entier : on ecrit ce
- * qu'on a, et on remonte le nombre de chunks manquants dans le rapport.
+ * A failed chunk no longer brings down (nor blocks) the whole server: we write what we
+ * have, and report the number of missing chunks.
  */
 async function updateServer(server: string, bundle: ItemsBundle, itemIds: number[],
                             redis: RedisClientType, onChunkDone: () => void): Promise<ServerRunResult> {
@@ -155,10 +155,10 @@ async function updateServer(server: string, bundle: ItemsBundle, itemIds: number
         }
 
         const time = Date.now() - start;
-        console.log(`${server} ${failedChunks === 0 ? 'ok' : `partiel (${failedChunks}/${chunks.length} chunks KO)`}, ${Math.floor(time / 1000)}s`);
+        console.log(`${server} ${failedChunks === 0 ? 'ok' : `partial (${failedChunks}/${chunks.length} chunks failed)`}, ${Math.floor(time / 1000)}s`);
         return {server, success: failedChunks === 0, failedChunks, time, items};
     } catch (err) {
-        console.log(`${server} KO: ${err.message}`);
+        console.log(`${server} failed: ${err.message}`);
         return {
             server,
             success: false,
@@ -170,7 +170,7 @@ async function updateServer(server: string, bundle: ItemsBundle, itemIds: number
     }
 }
 
-/** Une alerte separee, et seulement quand c'est actionnable : un embed edite ne ping pas. */
+/** A separate alert, and only when actionable: an edited embed does not ping. */
 async function maybeAlert(state: CycleState): Promise<void> {
     const snap = snapshotStats();
     if (!isDegraded(state, snap)) {
@@ -180,14 +180,14 @@ async function maybeAlert(state: CycleState): Promise<void> {
     await postMessage({
         content: MENTION,
         embeds: [{
-            title: 'Cycle dégradé',
+            title: 'Degraded cycle',
             color: COLOR_ERROR,
-            description: `${failed.length}/${state.serversTotal} serveurs incomplets, `
-                + `${snap.abandoned}/${snap.requests} requêtes abandonnées.`,
+            description: `${failed.length}/${state.serversTotal} servers incomplete, `
+                + `${snap.abandoned}/${snap.requests} requests abandoned.`,
             fields: [
-                {name: 'Détail', value: incidentSummary(snap, failed)},
+                {name: 'Details', value: incidentSummary(snap, failed)},
                 ...(snap.sampleFailures.length > 0
-                    ? [{name: 'Exemples', value: snap.sampleFailures.join('\n').slice(0, 1024)}]
+                    ? [{name: 'Samples', value: snap.sampleFailures.join('\n').slice(0, 1024)}]
                     : [])
             ]
         }]
@@ -240,17 +240,17 @@ async function runCycle(servers: string[], bundle: ItemsBundle, itemIds: number[
 }
 
 /**
- * Au demarrage : si un message de progression traine, c'est que le process est tombe
- * en cours de cycle. On le clot explicitement plutot que de laisser une barre figee.
+ * On startup: a leftover progress message id means the process died mid-cycle. Close
+ * it explicitly rather than leaving a frozen progress bar in the channel.
  */
 async function announceStartup(redis: RedisClientType, servers: number, itemCount: number): Promise<void> {
     const orphan = await redis.get(PROGRESS_MSG_KEY);
     if (orphan) {
         await editMessage(orphan, {
             embeds: [{
-                title: 'Cycle interrompu',
+                title: 'Cycle interrupted',
                 color: COLOR_ERROR,
-                description: 'Le process a redémarré avant la fin de ce cycle.'
+                description: 'The process restarted before this cycle finished.'
             }]
         });
         await redis.del(PROGRESS_MSG_KEY);
@@ -259,14 +259,14 @@ async function announceStartup(redis: RedisClientType, servers: number, itemCoun
     const chunks = Math.ceil(itemCount / 100) * servers;
     await postMessage({
         embeds: [{
-            title: 'Updater démarré',
+            title: 'Updater started',
             color: COLOR_INFO,
-            description: `${servers} serveurs · ${itemCount} items · ${chunks} chunks (${chunks * 2} requêtes par cycle).`,
+            description: `${servers} servers · ${itemCount} items · ${chunks} chunks (${chunks * 2} requests per cycle).`,
             fields: [{
-                name: 'Durée attendue',
+                name: 'Expected duration',
                 value: average
-                    ? `${formatDuration(average)} (moyenne des cycles précédents)`
-                    : `${formatDuration(aprioriCycleMs(chunks, servers, getConfiguredRate()))} (estimation théorique)`,
+                    ? `${formatDuration(average)} (average of previous cycles)`
+                    : `${formatDuration(aprioriCycleMs(chunks, servers, getConfiguredRate()))} (theoretical estimate)`,
                 inline: true
             }]
         }]
@@ -299,7 +299,7 @@ coreData$.pipe(
         console.error('PIPELINE ERROR', err.message);
         postMessage({
             content: MENTION,
-            embeds: [{title: 'Updater arrêté', color: COLOR_ERROR, description: err.message.slice(0, 500)}]
+            embeds: [{title: 'Updater stopped', color: COLOR_ERROR, description: err.message.slice(0, 500)}]
         });
     }
 });
@@ -308,7 +308,7 @@ coreData$.pipe(
 updated$.pipe(debounceTime(86400000)).subscribe(() => {
     postMessage({
         content: MENTION,
-        embeds: [{title: 'Aucune mise à jour depuis plus de 24 h', color: COLOR_ERROR}]
+        embeds: [{title: 'No updates for more than a day', color: COLOR_ERROR}]
     });
     exec('pm2 restart Updater');
 });

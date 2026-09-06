@@ -2,9 +2,9 @@ import {Agent} from 'https';
 import axios, {AxiosError, AxiosInstance} from 'axios';
 
 /**
- * Nombre de connexions simultanees vers Universalis, et debit cible en requetes/seconde.
- * Le debit reel est pilote par le token bucket ci-dessous : il ne depend pas de la latence,
- * contrairement a un simple delay() couple a une concurrence fixe.
+ * Simultaneous connections to Universalis, and target throughput in requests/second.
+ * Actual throughput is driven by the token bucket below, so it does not depend on
+ * latency the way a plain delay() paired with a fixed concurrency does.
  */
 const CONCURRENCY = Number(process.env.UNIVERSALIS_CONCURRENCY || 8);
 const RATE_PER_SEC = Number(process.env.UNIVERSALIS_RPS || 20);
@@ -13,8 +13,8 @@ const MAX_ATTEMPTS = 5;
 const TOTAL_BUDGET_MS = 90000;
 
 /**
- * Interface plate plutot qu'union discriminee : le projet compile avec strictNullChecks
- * desactive, ou le narrowing sur `ok` ne fonctionne pas.
+ * A flat interface rather than a discriminated union: the project compiles with
+ * strictNullChecks off, where narrowing on `ok` does not work.
  */
 export interface UniversalisResult<T> {
     ok: boolean;
@@ -31,7 +31,7 @@ const http: AxiosInstance = axios.create({
     timeout: REQUEST_TIMEOUT,
     decompress: true,
     headers: {'User-Agent': 'FFXIV Teamcraft Profits Helper'},
-    // keep-alive : evite un handshake TLS par requete (~20k requetes par cycle)
+    // keep-alive: avoids one TLS handshake per request (~40k requests per cycle)
     httpsAgent: new Agent({keepAlive: true, maxSockets: CONCURRENCY, keepAliveMsecs: 30000})
 });
 
@@ -40,7 +40,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Token bucket : lisse le debit sur la duree, avec un petit burst autorise.
+ * Token bucket: smooths throughput over time, with a small burst allowance.
  */
 class RateLimiter {
     private tokens: number;
@@ -73,8 +73,8 @@ class RateLimiter {
 }
 
 /**
- * Borne le nombre de requetes en vol. Une requete lente ne peut plus confisquer
- * un slot indefiniment : le timeout axios et le budget total y veillent.
+ * Bounds the number of in-flight requests. A slow request can no longer hold a slot
+ * indefinitely: the axios timeout and the total budget take care of that.
  */
 class Semaphore {
     private active = 0;
@@ -113,11 +113,11 @@ const limiter = new RateLimiter(RATE_PER_SEC);
 const gate = new Semaphore(CONCURRENCY);
 
 /**
- * Compteurs du cycle courant. Ils alimentent le rapport Discord : c'est ce qui evite
- * d'avoir a ouvrir les logs pour savoir si un cycle se passe bien.
+ * Counters for the current cycle. They feed the Discord report, which is what removes
+ * the need to open the logs to know whether a cycle is going well.
  *
- * On distingue les tentatives ratees (bruit : une 503 retentee avec succes n'appelle
- * aucune action) des abandons definitifs (actionnable : de la donnee manque).
+ * Failed attempts (noise: a 503 retried successfully needs no action) are kept separate
+ * from definitive abandons (actionable: data is missing).
  */
 export interface UniversalisSnapshot {
     requests: number;
@@ -173,14 +173,14 @@ export function resetStats(): void {
     stats.sampleFailures = [];
 }
 
-/** Debit cible, utilise pour estimer la duree d'un cycle avant toute mesure. */
+/** Target throughput, used to estimate cycle duration before anything is measured. */
 export function getConfiguredRate(): number {
     return RATE_PER_SEC;
 }
 
 /**
- * Coupe-circuit progressif : si Universalis souffre, on ralentit tout seul,
- * puis on remonte doucement des que ca repasse.
+ * Gradual circuit breaker: if Universalis struggles we slow down on our own, then
+ * ramp back up once it recovers.
  */
 let consecutiveFailures = 0;
 
@@ -188,7 +188,7 @@ function onFailure(): void {
     consecutiveFailures++;
     if (consecutiveFailures % 10 === 0) {
         limiter.setRate(Math.max(2, limiter.currentRate * 0.5));
-        console.warn(`[universalis] ${consecutiveFailures} echecs consecutifs, debit reduit a ${limiter.currentRate.toFixed(1)} req/s`);
+        console.warn(`[universalis] ${consecutiveFailures} consecutive failures, throughput reduced to ${limiter.currentRate.toFixed(1)} req/s`);
     }
 }
 
@@ -204,7 +204,7 @@ function onSuccess(): void {
 function classify(err: AxiosError): { retryable: boolean, status: number | null, waitMs?: number } {
     const status = err.response ? err.response.status : null;
     if (status === null) {
-        // timeout, ECONNRESET, DNS... : transitoire
+        // timeout, ECONNRESET, DNS... : transient
         return {retryable: true, status};
     }
     if (status === 429) {
@@ -214,13 +214,13 @@ function classify(err: AxiosError): { retryable: boolean, status: number | null,
     if (status >= 500) {
         return {retryable: true, status};
     }
-    // 400 / 404 : le monde ou l'item n'existe pas, retenter est inutile
+    // 400 / 404: the world or item does not exist, retrying is pointless
     return {retryable: false, status};
 }
 
 /**
- * Ne rejette jamais et emet toujours exactement un resultat : c'est ce qui empeche
- * un combineLatest en aval de rester bloque indefiniment sur une requete morte.
+ * Never rejects and always yields exactly one result: this is what stops a downstream
+ * combineLatest from hanging forever on a dead request.
  */
 export async function universalisGet<T = any>(url: string, errors$?: ErrorSink): Promise<UniversalisResult<T>> {
     const deadline = Date.now() + TOTAL_BUDGET_MS;
@@ -249,7 +249,7 @@ export async function universalisGet<T = any>(url: string, errors$?: ErrorSink):
             if (!retryable || attempt === MAX_ATTEMPTS || Date.now() > deadline) {
                 break;
             }
-            // backoff exponentiel plafonne, avec jitter complet pour desynchroniser les reprises
+            // capped exponential backoff, with full jitter to desynchronise retries
             const base = Math.min(30000, 500 * Math.pow(2, attempt));
             await sleep(waitMs !== undefined ? waitMs : Math.random() * base);
         } finally {
@@ -264,7 +264,7 @@ export async function universalisGet<T = any>(url: string, errors$?: ErrorSink):
     }
 
     console.error(`${lastReason}\n${url}`);
-    // un seul signalement par requete, et non un par tentative
+    // one report per request, not one per attempt
     if (errors$) {
         errors$.next({source: `[Universalis] ${url}`, message: lastReason});
     }
